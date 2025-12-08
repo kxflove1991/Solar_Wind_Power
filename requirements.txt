@@ -1,0 +1,13 @@
+pandas
+numpy
+pvlib
+requests
+scipy
+netCDF4
+xarray
+tables
+openpyxl
+pytest
+matplotlib
+seaborn
+
