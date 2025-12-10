@@ -65,6 +65,133 @@ class Visualizer:
         Visualizer._save_figure(fig, save_path)
 
     @staticmethod
+    def plot_wind_analysis(weather_df, save_dir):
+        """
+        绘制风资源分析图表：
+        1. 风速频率分布 + Weibull 拟合
+        2. 风速月变化箱线图
+        3. 风速日变化曲线
+        """
+        from scipy.stats import weibull_min
+
+        # 1. 风速频率分布
+        save_path_dist = Path(save_dir) / "wind_speed_distribution.png"
+        fig1, ax1 = plt.subplots(figsize=(12, 8))
+        
+        data = weather_df['wind_speed'].dropna()
+        
+        # 直方图
+        sns.histplot(data, stat="density", element="step", fill=True, color='skyblue', label='观测数据', ax=ax1)
+        
+        # Weibull 拟合
+        if len(data) > 0:
+            try:
+                params = weibull_min.fit(data, floc=0)
+                x = np.linspace(0, data.max() + 5, 100)
+                ax1.plot(x, weibull_min.pdf(x, *params), 'r-', lw=2, label=f'Weibull 拟合 (k={params[0]:.2f}, c={params[2]:.2f})')
+            except Exception as e:
+                logging.warning(f"Weibull fitting failed: {e}")
+            
+        ax1.set_xlabel("风速 (m/s)")
+        ax1.set_ylabel("概率密度")
+        ax1.set_title("风速频率分布与 Weibull 拟合")
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        Visualizer._save_figure(fig1, save_path_dist)
+
+        # 2. 月变化 & 日变化 (合并在一个图中)
+        save_path_prof = Path(save_dir) / "wind_speed_profiles.png"
+        fig2, (ax2, ax3) = plt.subplots(2, 1, figsize=(12, 12))
+        
+        # 月变化 (箱线图)
+        # 确保有 month 列 (如果不修改原始 df，用 copy)
+        df_plot = weather_df.copy()
+        df_plot['month'] = df_plot.index.month
+        try:
+            sns.boxplot(x='month', y='wind_speed', data=df_plot, ax=ax2, palette="Blues", hue='month', legend=False)
+        except TypeError:
+            # 旧版本 seaborn 兼容
+            sns.boxplot(x='month', y='wind_speed', data=df_plot, ax=ax2, palette="Blues")
+        ax2.set_xlabel("月份")
+        ax2.set_ylabel("风速 (m/s)")
+        ax2.set_title("风速月变化特征")
+        ax2.grid(True, axis='y', alpha=0.3)
+        
+        # 日变化 (平均曲线 + 标准差)
+        df_plot['hour'] = df_plot.index.hour
+        # seaborn >= 0.12 uses errorbar='sd', older uses ci='sd'
+        try:
+            sns.lineplot(x='hour', y='wind_speed', data=df_plot, ax=ax3, errorbar='sd', color='tab:blue')
+        except TypeError:
+            sns.lineplot(x='hour', y='wind_speed', data=df_plot, ax=ax3, ci='sd', color='tab:blue')
+            
+        ax3.set_xlabel("小时 (0-23)")
+        ax3.set_ylabel("风速 (m/s)")
+        ax3.set_title("风速日变化特征 (平均值 ± 标准差)")
+        ax3.set_xlim(0, 23)
+        ax3.set_xticks(range(0, 24, 2))
+        ax3.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        Visualizer._save_figure(fig2, save_path_prof)
+
+    @staticmethod
+    def plot_wind_power_analysis(output_df, save_dir):
+        """
+        绘制风电出力分析图表:
+        1. 出力热力图
+        2. 出力 Duration Curve
+        """
+        # 1. 热力图
+        save_path_hm = Path(save_dir) / "wind_heatmap.png"
+        matrix = Visualizer._prepare_heatmap_data(output_df['Wind_PU'])
+        
+        fig1, ax1 = plt.subplots(figsize=(12, 8))
+        im = ax1.imshow(matrix, aspect='auto', cmap='viridis', origin='lower', extent=[0, 365, 0, 24], vmin=0, vmax=1)
+        ax1.set_title("风电出力标幺值年分布热力图", fontsize=14)
+        ax1.set_xlabel("天数 (1-365)")
+        ax1.set_ylabel("小时 (0-23)")
+        
+        month_starts = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+        month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+        ax1.set_xticks([x + 15 for x in month_starts])
+        ax1.set_xticklabels(month_names)
+        
+        cbar = plt.colorbar(im, ax=ax1)
+        cbar.set_label("标幺值")
+        Visualizer._save_figure(fig1, save_path_hm)
+        
+        # 2. Duration Curve
+        save_path_dc = Path(save_dir) / "wind_duration_curve.png"
+        sorted_pu = output_df['Wind_PU'].sort_values(ascending=False).reset_index(drop=True)
+        hours = np.arange(len(sorted_pu))
+        
+        fig2, ax2 = plt.subplots(figsize=(12, 8))
+        ax2.plot(sorted_pu, hours, color='tab:green', linewidth=2)
+        ax2.set_xlabel("风电出力标幺值 (0-1)")
+        ax2.set_ylabel("累计小时数 (0-8760)")
+        ax2.set_title("风电出力持续曲线 (Duration Curve)", fontsize=14)
+        ax2.set_xlim(0, 1)
+        ax2.set_ylim(0, 8760)
+        ax2.grid(True, alpha=0.3)
+        
+        # P50/P90
+        p50_idx = int(len(sorted_pu) * 0.5)
+        p90_idx = int(len(sorted_pu) * 0.9)
+        p50_val = sorted_pu.iloc[p50_idx]
+        p90_val = sorted_pu.iloc[p90_idx]
+        
+        ax2.axvline(p50_val, color='orange', linestyle='--', alpha=0.8)
+        ax2.axhline(p50_idx, color='orange', linestyle='--', alpha=0.8)
+        ax2.text(p50_val + 0.02, p50_idx + 100, f'P50: {p50_val:.3f}', color='orange', fontweight='bold')
+        
+        ax2.axvline(p90_val, color='red', linestyle='--', alpha=0.8)
+        ax2.axhline(p90_idx, color='red', linestyle='--', alpha=0.8)
+        ax2.text(p90_val + 0.02, p90_idx + 100, f'P90: {p90_val:.3f}', color='red', fontweight='bold')
+        
+        Visualizer._save_figure(fig2, save_path_dc)
+
+    @staticmethod
     def plot_weather_duration_curves(df, save_dir):
         """
         3.1 气象参数 Duration Curve (频数分布)
@@ -114,8 +241,20 @@ class Visualizer:
         # 2. 提取小时和日期 (使用 Local Time)
         # 假设 index 已经是 datetime 格式，如果有时区，直接用
         df['hour'] = df.index.hour
-        df['date'] = df.index.date
-        df['day_of_year'] = df.index.dayofyear
+        # df['date'] = df.index.date
+        
+        # 处理闰年移除2月29日后的 day_of_year 偏移问题
+        is_leap = df.index.is_leap_year.any() if len(df) > 0 else False
+        if is_leap:
+            doy = df.index.dayofyear
+            has_leap_day = ((df.index.month == 2) & (df.index.day == 29)).any()
+            if not has_leap_day:
+                # 如果是闰年且移除了2月29日，将3月1日及以后的 day_of_year 减1，填补第60天的空缺
+                df['day_of_year'] = np.where(doy > 60, doy - 1, doy)
+            else:
+                df['day_of_year'] = doy
+        else:
+            df['day_of_year'] = df.index.dayofyear
         
         # 3. Pivot Table
         # 行: Hour (0-23)
@@ -148,7 +287,7 @@ class Visualizer:
         
         matrix = Visualizer._prepare_heatmap_data(output_df['PU'])
         
-        fig, ax = plt.subplots(figsize=(12, 6))
+        fig, ax = plt.subplots(figsize=(12, 8))
         
         # 绘制热力图
         im = ax.imshow(matrix, aspect='auto', cmap='viridis', origin='lower',
@@ -217,9 +356,9 @@ class Visualizer:
         ax.text(p50_val + 0.02, p50_idx + 100, f'P50: {p50_val:.3f}', color='orange', fontweight='bold')
         
         # P90
-        ax.axvline(p90_val, color='green', linestyle='--', alpha=0.8)
-        ax.axhline(p90_idx, color='green', linestyle='--', alpha=0.8)
-        ax.text(p90_val + 0.02, p90_idx + 100, f'P90: {p90_val:.3f}', color='green', fontweight='bold')
+        ax.axvline(p90_val, color='red', linestyle='--', alpha=0.8)
+        ax.axhline(p90_idx, color='red', linestyle='--', alpha=0.8)
+        ax.text(p90_val + 0.02, p90_idx + 100, f'P90: {p90_val:.3f}', color='red', fontweight='bold')
         
         Visualizer._save_figure(fig, save_path)
 

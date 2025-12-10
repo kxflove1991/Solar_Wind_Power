@@ -3,6 +3,7 @@ import pvlib
 import pandas as pd
 import numpy as np
 import logging
+import time
 from pathlib import Path
 
 # 配置日志
@@ -55,84 +56,114 @@ class DataManager:
                 # 确保时区信息 (CSV读取后通常丢失时区，设为UTC)
                 if data.index.tz is None:
                     data.index = data.index.tz_localize('UTC')
+                
+                # 移除闰年2月29日数据 (标准化为8760小时)
+                if not data.empty:
+                    initial_len = len(data)
+                    data = data[~((data.index.month == 2) & (data.index.day == 29))]
+                    
+                    if len(data) == 8760:
+                        if initial_len > 8760:
+                            logging.info(f"检测到闰年数据 (缓存)，已移除2月29日 (原始: {initial_len} -> 标准化: {len(data)})")
+                        else:
+                            logging.info("数据完整性确认 (缓存): 8760 小时")
+                    
                 return data
             except Exception as e:
                 logging.warning(f"缓存读取失败，将重新下载: {e}")
 
         # 2. 下载数据
         logging.info(f"开始下载: Lat={lat}, Lon={lon}, Year={year}, DB={database}")
-        try:
-            # get_pvgis_hourly 返回值可能随版本不同
-            # 通常为 (data, inputs, metadata) 或 (data, metadata)
-            res = pvlib.iotools.get_pvgis_hourly(
-                latitude=lat,
-                longitude=lon,
-                start=year,
-                end=year,
-                raddatabase=database,
-                components=True,
-                url='https://re.jrc.ec.europa.eu/api/v5_2/'
-            )
-            
-            if len(res) == 3:
-                data, inputs, metadata = res
-            elif len(res) == 2:
-                data, metadata = res
-                inputs = {} # 默认为空
-            else:
-                data = res[0]
-            
-            # Debug: 打印列名
-            logging.info(f"PVGIS 返回列名: {data.columns.tolist()}")
+        
+        max_retries = 3
+        retry_delay = 2 # 初始延迟秒数
+        
+        for attempt in range(max_retries):
+            try:
+                # get_pvgis_hourly 返回值可能随版本不同
+                # 通常为 (data, inputs, metadata) 或 (data, metadata)
+                res = pvlib.iotools.get_pvgis_hourly(
+                    latitude=lat,
+                    longitude=lon,
+                    start=year,
+                    end=year,
+                    raddatabase=database,
+                    components=True,
+                    url='https://re.jrc.ec.europa.eu/api/v5_2/'
+                )
+                break # 成功则跳出循环
+            except Exception as e:
+                logging.warning(f"下载尝试 {attempt + 1}/{max_retries} 失败: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay * (attempt + 1)) # 指数退避
+                else:
+                    logging.error(f"数据获取失败，已达到最大重试次数")
+                    raise
+        
+        # 3. 处理下载结果
+        if len(res) == 3:
+            data, inputs, metadata = res
+        elif len(res) == 2:
+            data, metadata = res
+            inputs = {} # 默认为空
+        else:
+            data = res[0]
+        
+        # Debug: 打印列名
+        logging.info(f"PVGIS 返回列名: {data.columns.tolist()}")
 
-            # 3. 标准化处理
-            # PVGIS 返回列名可能为: 'poa_global', 'bi', 'di', 'ri' 等
-            # 或者 'G(h)', 'Gb(n)', 'Gd(h)'
-            rename_map = {
-                'T2m': 'temp_air', 
-                'WS10m': 'wind_speed',
-                'poa_global': 'ghi', # 假设水平面
-                'Gb(n)': 'dni',
-                'Gd(h)': 'dhi',
-                'G(h)': 'ghi',
-            }
-            data = data.rename(columns={k: v for k, v in rename_map.items() if k in data.columns})
+        # 3. 标准化处理
+        # PVGIS 返回列名可能为: 'poa_global', 'bi', 'di', 'ri' 等
+        # 或者 'G(h)', 'Gb(n)', 'Gd(h)'
+        rename_map = {
+            'T2m': 'temp_air', 
+            'WS10m': 'wind_speed',
+            'poa_global': 'ghi', # 假设水平面
+            'Gb(n)': 'dni',
+            'Gd(h)': 'dhi',
+            'G(h)': 'ghi',
+        }
+        data = data.rename(columns={k: v for k, v in rename_map.items() if k in data.columns})
 
-            # 4. 如果缺少 GHI/DNI/DHI，尝试从 POA 重构 (假设 horizontal)
-            if 'ghi' not in data.columns and 'poa_direct' in data.columns:
-                logging.info("通过 POA 分量重构 GHI/DNI/DHI...")
-                data['ghi'] = data['poa_direct'] + data['poa_sky_diffuse'] + data['poa_ground_diffuse']
-                data['dhi'] = data['poa_sky_diffuse']
-                
-                # 计算 DNI = Beam_Horiz / cos(Zenith)
-                loc = pvlib.location.Location(lat, lon)
-                solpos = loc.get_solarposition(data.index)
-                zenith = solpos['apparent_zenith']
-                
-                # 避免除以零 (cos(85) ~ 0.087)
-                cos_z = np.cos(np.radians(zenith))
-                data['dni'] = data['poa_direct'] / np.maximum(cos_z, 0.01) # 限制最小值
-                
-                # 夜间修正
-                data.loc[zenith > 85, 'dni'] = 0
-                data.loc[zenith > 85, 'ghi'] = 0
-                data.loc[zenith > 85, 'dhi'] = 0
+        # 4. 如果缺少 GHI/DNI/DHI，尝试从 POA 重构 (假设 horizontal)
+        if 'ghi' not in data.columns and 'poa_direct' in data.columns:
+            logging.info("通过 POA 分量重构 GHI/DNI/DHI...")
+            data['ghi'] = data['poa_direct'] + data['poa_sky_diffuse'] + data['poa_ground_diffuse']
+            data['dhi'] = data['poa_sky_diffuse']
+            
+            # 计算 DNI = Beam_Horiz / cos(Zenith)
+            loc = pvlib.location.Location(lat, lon)
+            solpos = loc.get_solarposition(data.index)
+            zenith = solpos['apparent_zenith']
+            
+            # 避免除以零 (cos(85) ~ 0.087)
+            cos_z = np.cos(np.radians(zenith))
+            data['dni'] = data['poa_direct'] / np.maximum(cos_z, 0.01) # 限制最小值
+            
+            # 夜间修正
+            data.loc[zenith > 85, 'dni'] = 0
+            data.loc[zenith > 85, 'ghi'] = 0
+            data.loc[zenith > 85, 'dhi'] = 0
 
-            # 简单校验
-            required = ['ghi', 'dni', 'dhi', 'temp_air']
-            
-            # 简单校验
-            required = ['ghi', 'dni', 'dhi', 'temp_air']
-            missing = [col for col in required if col not in data.columns]
-            if missing:
-                logging.warning(f"警告: 数据缺少必要列: {missing}，可能影响后续计算")
+        # 简单校验
+        required = ['ghi', 'dni', 'dhi', 'temp_air']
+        missing = [col for col in required if col not in data.columns]
+        if missing:
+            logging.warning(f"警告: 数据缺少必要列: {missing}，可能影响后续计算")
 
-            # 4. 写入缓存
-            data.to_csv(cache_file)
-            logging.info(f"数据已缓存至: {cache_file}")
+        # 4. 写入缓存
+        data.to_csv(cache_file)
+        logging.info(f"数据已缓存至: {cache_file}")
+        
+        # 5. 移除闰年2月29日数据 (标准化为8760小时)
+        if not data.empty:
+            initial_len = len(data)
+            data = data[~((data.index.month == 2) & (data.index.day == 29))]
             
-            return data
-            
-        except Exception as e:
-            logging.error(f"数据获取失败: {e}")
-            raise
+            if len(data) == 8760:
+                if initial_len > 8760:
+                    logging.info(f"检测到闰年数据，已移除2月29日 (原始: {initial_len} -> 标准化: {len(data)})")
+                else:
+                    logging.info("数据完整性确认: 8760 小时")
+
+        return data

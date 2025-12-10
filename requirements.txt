@@ -10,4 +10,5 @@ openpyxl
 pytest
 matplotlib
 seaborn
+windpowerlib
 
