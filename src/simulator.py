@@ -6,6 +6,8 @@ from pvlib.temperature import TEMPERATURE_MODEL_PARAMETERS
 import pandas as pd
 import logging
 
+logger = logging.getLogger(__name__)
+
 class PVSimulator:
     def __init__(self, lat, lon, capacity_mw=1.0, surface_tilt=None, surface_azimuth=180, module_name=None, inverter_name=None):
         """
@@ -82,17 +84,17 @@ class PVSimulator:
             spectral_model='no_loss', 
             losses_model='pvwatts'
         )
-        logging.info("PVSystem 初始化完成")
+        logger.info("PVSystem 初始化完成")
 
     def run(self, weather_data):
         """
         执行模拟
         :param weather_data: 包含 ghi, dni, dhi, temp_air, wind_speed 的 DataFrame
         """
-        logging.info("开始光伏出力模拟...")
+        logger.info("开始光伏出力模拟...")
         try:
             self.mc.run_model(weather_data)
             return self.mc.results
         except Exception as e:
-            logging.error(f"模拟失败: {e}")
+            logger.error(f"模拟失败: {e}")
             raise

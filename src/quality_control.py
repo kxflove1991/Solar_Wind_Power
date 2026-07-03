@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 from datetime import datetime
 
+logger = logging.getLogger(__name__)
 
 class QualityControl:
     def __init__(self, output_dir='reports'):
@@ -16,7 +17,7 @@ class QualityControl:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         entry = f"[{timestamp}] {message}"
         self.logs.append(entry)
-        logging.info(message)
+        logger.info(message)
 
     def check_integrity(self, df, name="Data"):
         """
@@ -58,6 +59,7 @@ class QualityControl:
     def detect_outliers(self, df, columns, sigma=3):
         """
         基于 3-sigma 原则检测异常值
+        对辐射数据（ghi, dni, dhi）使用分时段检测（白天/夜间），避免误报
         """
         self.log(f"开始检测异常值 (Sigma={sigma})...")
         outliers = {}
@@ -67,22 +69,44 @@ class QualityControl:
                 continue
                 
             data = df[col]
-            mean = data.mean()
-            std = data.std()
             
-            # 定义阈值
-            lower = mean - sigma * std
-            upper = mean + sigma * std
-            
-            # 查找异常
-            mask = (data < lower) | (data > upper)
-            count = mask.sum()
-            
-            if count > 0:
-                self.log(f"列 '{col}': 发现 {count} 个异常值 (范围: [{lower:.2f}, {upper:.2f}])")
-                outliers[col] = count
-                # 标记异常值 (可选：添加一列标记)
-                # df[f'{col}_flag'] = mask
+            # 对辐射数据使用分时段检测
+            if col in ['ghi', 'dni', 'dhi']:
+                # 白天数据（ghi > 0）
+                daytime_mask = df['ghi'] > 0 if 'ghi' in df.columns else data > 0
+                daytime_data = data[daytime_mask]
+                
+                if len(daytime_data) > 0:
+                    mean = daytime_data.mean()
+                    std = daytime_data.std()
+                    lower = mean - sigma * std
+                    upper = mean + sigma * std
+                    
+                    # 只检测白天数据的异常值
+                    mask = (data < lower) | (data > upper)
+                    # 夜间数据（ghi == 0）不标记为异常
+                    mask = mask & daytime_mask
+                    count = mask.sum()
+                    
+                    if count > 0:
+                        self.log(f"列 '{col}': 发现 {count} 个异常值 (白天范围: [{lower:.2f}, {upper:.2f}])")
+                        outliers[col] = count
+            else:
+                # 其他数据使用全局 3-sigma
+                mean = data.mean()
+                std = data.std()
+                
+                # 定义阈值
+                lower = mean - sigma * std
+                upper = mean + sigma * std
+                
+                # 查找异常
+                mask = (data < lower) | (data > upper)
+                count = mask.sum()
+                
+                if count > 0:
+                    self.log(f"列 '{col}': 发现 {count} 个异常值 (范围: [{lower:.2f}, {upper:.2f}])")
+                    outliers[col] = count
         
         if not outliers:
             self.log("未发现显著异常值")
@@ -107,8 +131,6 @@ class QualityControl:
                 for entry in self.logs:
                     f.write(entry + "\n")
                     
-            logging.info(f"报告已保存至 {filepath}")
+            logger.info(f"报告已保存至 {filepath}")
         except Exception as e:
-            logging.error(f"保存报告失败: {e}")
-
-
+            logger.error(f"保存报告失败: {e}")

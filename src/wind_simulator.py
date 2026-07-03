@@ -3,6 +3,8 @@ import numpy as np
 import logging
 from windpowerlib import ModelChain, WindTurbine
 
+logger = logging.getLogger(__name__)
+
 class WindSimulator:
     def __init__(self, lat, lon, capacity_mw=1.0, hub_height=120, turbine_type='custom_10mw'):
         """
@@ -19,47 +21,34 @@ class WindSimulator:
         self.hub_height = hub_height
         self.turbine_type = turbine_type
         
-        logging.info(f"初始化风电模拟器: 机型={turbine_type}, 轮毂高度={hub_height}m, 目标容量={capacity_mw}MW")
+        logger.info(f"初始化风电模拟器: 机型={turbine_type}, 轮毂高度={hub_height}m, 目标容量={capacity_mw}MW")
         
         if turbine_type == 'custom_10mw':
             # 自定义 10MW 风机功率曲线 (参考通用 10MW 级风机特性)
             # Cut-in: ~3m/s, Rated: ~11m/s, Cut-out: 25m/s
-            logging.info("使用自定义 10MW 风机模型 (适用于中国西北地区大型风机)")
+            logger.info("使用自定义 10MW 风机模型 (适用于中国西北地区大型风机)")
+            
+            # 构建完整的风速-功率点 (0-25 m/s)
+            wind_speeds = [0.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
+            power_values = [0.0, 0.0, 150_000.0, 650_000.0, 1_200_000.0, 2_100_000.0, 
+                           3_300_000.0, 5_000_000.0, 7_000_000.0, 8_800_000.0, 10_000_000.0, 10_000_000.0]
+            
+            # 补充 13-24 m/s 的额定功率点
+            for ws in range(13, 25):
+                wind_speeds.append(float(ws))
+                power_values.append(10_000_000.0)
+            
+            # 添加切出风速点
+            wind_speeds.extend([25.0, 25.1])
+            power_values.extend([10_000_000.0, 0.0])
+            
             self.turbine = WindTurbine(
                 hub_height=hub_height,
                 nominal_power=10_000_000, # 10MW
                 power_curve=pd.DataFrame(
                     data={
-                        'value': [
-                            0.0, 0.0,           # 0-2 m/s
-                            150_000.0,          # 3 m/s (Cut-in)
-                            650_000.0,          # 4 m/s
-                            1_200_000.0,        # 5 m/s
-                            2_100_000.0,        # 6 m/s
-                            3_300_000.0,        # 7 m/s
-                            5_000_000.0,        # 8 m/s
-                            7_000_000.0,        # 9 m/s
-                            8_800_000.0,        # 10 m/s
-                            10_000_000.0,       # 11 m/s (Rated)
-                            10_000_000.0,       # 12 m/s
-                            10_000_000.0,       # 25 m/s (Cut-out)
-                            0.0                 # >25 m/s
-                        ],
-                        'wind_speed': [
-                            0.0, 2.0, 
-                            3.0, 
-                            4.0, 
-                            5.0, 
-                            6.0, 
-                            7.0, 
-                            8.0, 
-                            9.0, 
-                            10.0, 
-                            11.0, 
-                            12.0, 
-                            25.0, 
-                            25.1
-                        ]
+                        'value': power_values,
+                        'wind_speed': wind_speeds
                     }
                 ),
                 power_coefficient_curve=None
@@ -72,7 +61,7 @@ class WindSimulator:
                     turbine_type=turbine_type
                 )
             except Exception as e:
-                logging.warning(f"无法加载指定风机数据 ({e})，将使用通用 2MW 风机参数")
+                logger.warning(f"无法加载指定风机数据 ({e})，将使用通用 2MW 风机参数")
                 # 备用：定义一个通用的 2MW 风机
                 self.turbine = WindTurbine(
                     hub_height=hub_height,
@@ -100,7 +89,7 @@ class WindSimulator:
         :param weather_df: 必须包含 'wind_speed' (m/s), 'temp_air' (C)
         :return: Series (功率, 单位 W)
         """
-        logging.info("开始风电出力模拟...")
+        logger.info("开始风电出力模拟...")
         
         # 准备 windpowerlib 需要的数据格式 (MultiIndex)
         df = pd.DataFrame(index=weather_df.index)
@@ -133,6 +122,14 @@ class WindSimulator:
         # 获取结果 (单机功率 W)
         power_w = self.mc.power_output
         
+        # 验证结果
+        if power_w is None:
+            raise RuntimeError("风电模拟失败: power_output 为 None")
+        if len(power_w) != len(weather_df):
+            raise RuntimeError(f"风电模拟输出长度不匹配: 期望 {len(weather_df)}, 实际 {len(power_w)}")
+        if power_w.isna().all():
+            raise RuntimeError("风电模拟结果全部为 NaN")
+        
         # 缩放到目标容量
         if self.turbine.nominal_power:
             scale_factor = (self.capacity_mw * 1e6) / self.turbine.nominal_power
@@ -144,6 +141,6 @@ class WindSimulator:
         # 确保没有负值
         final_power = final_power.clip(lower=0)
         
-        logging.info(f"风电模拟完成。总发电量: {final_power.sum()/1e6:.2f} MWh")
+        logger.info(f"风电模拟完成。总发电量: {final_power.sum()/1e6:.2f} MWh")
         
         return final_power

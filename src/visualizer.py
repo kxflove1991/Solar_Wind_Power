@@ -5,6 +5,8 @@ import numpy as np
 from pathlib import Path
 import logging
 
+logger = logging.getLogger(__name__)
+
 class Visualizer:
     @staticmethod
     def set_style():
@@ -23,9 +25,9 @@ class Visualizer:
             # 确保目录存在
             save_path.parent.mkdir(parents=True, exist_ok=True)
             fig.savefig(save_path, dpi=300, bbox_inches='tight')
-            logging.info(f"图表已保存: {save_path}")
+            logger.info(f"图表已保存: {save_path}")
         except Exception as e:
-            logging.error(f"图表保存失败: {e}")
+            logger.error(f"图表保存失败: {e}")
         finally:
             plt.close(fig)
 
@@ -33,11 +35,19 @@ class Visualizer:
     def plot_weather_trends(df, save_dir):
         """
         1. 全年气象数据趋势图 (5子图)
+        使用24小时滑动平均降采样，减少数据点数量
         """
         save_path = Path(save_dir) / "weather_trends_yearly.png"
         
-        # 准备数据 (0-8760)
-        plot_data = df.reset_index(drop=True)
+        # 准备数据：使用24小时滑动平均降采样
+        plot_data = df.copy()
+        # 对数值列进行24小时滑动平均
+        numeric_cols = ['wind_speed', 'temp_air', 'ghi', 'dni', 'dhi']
+        for col in numeric_cols:
+            if col in plot_data.columns:
+                plot_data[col] = plot_data[col].rolling(window=24, center=True, min_periods=1).mean()
+        
+        plot_data = plot_data.reset_index(drop=True)
         x_axis = plot_data.index
         
         fig, axes = plt.subplots(5, 1, figsize=(12, 15), sharex=True)
@@ -53,7 +63,7 @@ class Visualizer:
         
         for ax, (col, label, color) in zip(axes, params):
             if col in plot_data.columns:
-                ax.plot(x_axis, plot_data[col], color=color, linewidth=0.5)
+                ax.plot(x_axis, plot_data[col], color=color, linewidth=0.8)
                 ax.set_ylabel(label)
                 ax.grid(True, alpha=0.3)
             else:
@@ -90,7 +100,7 @@ class Visualizer:
                 x = np.linspace(0, data.max() + 5, 100)
                 ax1.plot(x, weibull_min.pdf(x, *params), 'r-', lw=2, label=f'Weibull 拟合 (k={params[0]:.2f}, c={params[2]:.2f})')
             except Exception as e:
-                logging.warning(f"Weibull fitting failed: {e}")
+                logger.warning(f"Weibull fitting failed: {e}")
             
         ax1.set_xlabel("风速 (m/s)")
         ax1.set_ylabel("概率密度")
