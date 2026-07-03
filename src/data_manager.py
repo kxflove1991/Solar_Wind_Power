@@ -1,187 +1,163 @@
-import os
-import pvlib
+import logging
+from pathlib import Path
 import pandas as pd
 import numpy as np
-import logging
-import time
-from pathlib import Path
+from datetime import datetime, timezone
+import pvlib
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# 必要列常量
-REQUIRED_COLUMNS = ['ghi', 'dni', 'dhi', 'temp_air']
+REQUIRED_COLUMNS = ['ghi', 'dni', 'dhi', 'temp_air', 'wind_speed']
+PVGIS_START_YEAR = 2005
+PVGIS_END_YEAR = 2023
+
 
 class DataManager:
-    def __init__(self, cache_dir='cache', raw_dir='data/raw/weather'):
+    """
+    负责从 PVGIS 获取气象数据、缓存、清洗和本地持久化。
+    """
+    def __init__(
+        self,
+        cache_dir: str = 'cache',
+        raw_dir: str = 'data/raw/weather',
+    ):
         self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(exist_ok=True)
         self.raw_dir = Path(raw_dir)
+
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.raw_dir.mkdir(parents=True, exist_ok=True)
 
-    def save_raw_data(self, df, lat, lon, year=None):
-        """保存原始气象数据 (使用站点+年份命名，避免重复文件)"""
-        if year is None:
-            # 尝试从数据索引推断年份
+    def _cache_file(self, lat: float, lon: float, year: int) -> Path:
+        return self.cache_dir / f"weather_{lat:.4f}_{lon:.4f}_{year}_PVGIS-ERA5.csv"
+
+    def _raw_file(self, lat: float, lon: float, year: int) -> Path:
+        return self.raw_dir / f"weather_{lat:.4f}_{lon:.4f}_{year}.csv"
+
+    def get_weather_data(
+        self,
+        lat: float,
+        lon: float,
+        year: int,
+        database: str = 'PVGIS-ERA5',
+        use_cache: bool = True,
+    ) -> pd.DataFrame:
+        """
+        获取指定经纬度和年份的逐时气象数据。
+
+        返回的 DataFrame 索引为 UTC 时间，包含列：
+        ['ghi', 'dni', 'dhi', 'temp_air', 'wind_speed']
+        """
+        self._validate_year(year)
+        cache_file = self._cache_file(lat, lon, year)
+
+        if use_cache and cache_file.exists():
+            logger.info(f"从缓存加载气象数据: {cache_file}")
+            df = self._load_from_csv(cache_file)
+            if df is not None and self._has_required_columns(df):
+                return df
+            logger.warning("缓存文件损坏或列缺失，重新下载")
             try:
-                year = df.index[0].year
-            except (AttributeError, IndexError):
-                year = pd.Timestamp.now().year
-        
-        filename = f"weather_{lat:.4f}_{lon:.4f}_{year}.csv"
-        filepath = self.raw_dir / filename
-        
-        # 添加元数据头
-        timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
-        metadata = f"# Location: Lat={lat}, Lon={lon}\n# Year: {year}\n# Created: {timestamp}\n# Source: PVGIS-ERA5\n"
-        
+                cache_file.unlink()
+            except OSError:
+                pass
+
+        logger.info(f"从 {database} 下载气象数据: lat={lat}, lon={lon}, year={year}")
+        df = self._download_pvgis(lat, lon, year, database=database)
+        self._validate_columns(df)
+
+        # 保存缓存和原始文件
+        self.save_raw_data(df, lat, lon, year)
+
+        return df
+
+    def _download_pvgis(self, lat: float, lon: float, year: int, database: str = 'PVGIS-ERA5') -> pd.DataFrame:
+        if database != 'PVGIS-ERA5':
+            raise ValueError(f"当前仅支持 PVGIS-ERA5 数据库，得到 {database}")
+
         try:
-            with open(filepath, 'w') as f:
-                f.write(metadata)
-                df.to_csv(f) # index is timestamp
-            logger.info(f"原始气象数据已保存: {filepath}")
-            return filepath
+            result = pvlib.iotools.get_pvgis_hourly(
+                lat,
+                lon,
+                start=year,
+                end=year,
+                rtd=True,
+                map_variables=True,
+                url='https://re.jrc.ec.europa.eu/api/v5_2/',
+                timeout=30,
+            )
+            # pvlib >= 0.13.0 返回 (data, meta)；旧版返回 (data, inputs, metadata)
+            data = result[0] if isinstance(result, tuple) else result
         except Exception as e:
-            logger.error(f"保存原始数据失败: {e}")
-            return None
+            raise RuntimeError(f"PVGIS 数据下载失败: {e}") from e
 
-    def get_weather_data(self, lat, lon, year, database='PVGIS-ERA5'):
-        """
-        获取气象数据 (优先读取缓存)
-        :param lat: 纬度
-        :param lon: 经度
-        :param year: 年份
-        :param database: 数据库 (默认 PVGIS-ERA5)
-        :return: DataFrame (标准化列名)
-        """
-        # 1. 检查缓存
-        # 文件名包含关键参数
-        cache_file = self.cache_dir / f"weather_{lat:.4f}_{lon:.4f}_{year}_{database}.csv"
-        
-        if cache_file.exists():
-            logger.info(f"命中缓存: {cache_file}")
-            # 读取缓存时需解析时间索引
-            try:
-                data = pd.read_csv(cache_file, index_col=0, parse_dates=True)
-                # 确保时区信息 (CSV读取后通常丢失时区，设为UTC)
-                if data.index.tz is None:
-                    data.index = data.index.tz_localize('UTC')
-                
-                # 验证必要列完整性
-                missing_cols = [col for col in REQUIRED_COLUMNS if col not in data.columns]
-                if missing_cols:
-                    logger.warning(f"缓存数据缺少必要列: {missing_cols}，将删除缓存并重新下载")
-                    try:
-                        cache_file.unlink()
-                    except Exception as e:
-                        logger.warning(f"删除损坏缓存文件失败: {e}")
-                    # 继续执行下载逻辑
-                else:
-                    # 移除闰年2月29日数据 (标准化为8760小时)
-                    if not data.empty:
-                        initial_len = len(data)
-                        data = data[~((data.index.month == 2) & (data.index.day == 29))]
-                        
-                        if len(data) == 8760:
-                            if initial_len > 8760:
-                                logger.info(f"检测到闰年数据 (缓存)，已移除2月29日 (原始: {initial_len} -> 标准化: {len(data)})")
-                            else:
-                                logger.info("数据完整性确认 (缓存): 8760 小时")
-                    
-                    return data
-            except Exception as e:
-                logger.warning(f"缓存读取失败，将重新下载: {e}")
+        # PVGIS 返回 UTC 时间；保持 UTC，由上层负责时区转换
+        if data.index.tz is None:
+            data.index = data.index.tz_localize('UTC')
 
-        # 2. 下载数据
-        logger.info(f"开始下载: Lat={lat}, Lon={lon}, Year={year}, DB={database}")
-        
-        max_retries = 3
-        retry_delay = 2 # 初始延迟秒数
-        
-        for attempt in range(max_retries):
-            try:
-                # get_pvgis_hourly 返回值可能随版本不同
-                # 通常为 (data, inputs, metadata) 或 (data, metadata)
-                res = pvlib.iotools.get_pvgis_hourly(
-                    latitude=lat,
-                    longitude=lon,
-                    start=year,
-                    end=year,
-                    raddatabase=database,
-                    components=True,
-                    url='https://re.jrc.ec.europa.eu/api/v5_2/'
-                )
-                break # 成功则跳出循环
-            except Exception as e:
-                logger.warning(f"下载尝试 {attempt + 1}/{max_retries} 失败: {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(retry_delay * (attempt + 1)) # 指数退避
-                else:
-                    logger.error(f"数据获取失败，已达到最大重试次数")
-                    raise
-        
-        # 3. 处理下载结果
-        if len(res) == 3:
-            data, inputs, metadata = res
-        elif len(res) == 2:
-            data, metadata = res
-            inputs = {} # 默认为空
-        else:
-            data = res[0]
-        
-        # Debug: 打印列名
-        logger.info(f"PVGIS 返回列名: {data.columns.tolist()}")
+        # 处理闰年的 2 月 29 日：删除该日数据，保证 8760 小时
+        data = self._remove_leap_day(data)
 
-        # 3. 标准化处理
-        # PVGIS 返回列名可能为: 'poa_global', 'bi', 'di', 'ri' 等
-        # 或者 'G(h)', 'Gb(n)', 'Gd(h)'
+        data = self._rename_columns(data)
+        return data
+
+    def _remove_leap_day(self, df: pd.DataFrame) -> pd.DataFrame:
+        if not isinstance(df.index, pd.DatetimeIndex):
+            raise TypeError("输入数据必须是 DatetimeIndex")
+        is_leap_feb29 = (df.index.month == 2) & (df.index.day == 29)
+        if is_leap_feb29.any():
+            logger.info(f"移除闰日数据，共 {is_leap_feb29.sum()} 条")
+            df = df.loc[~is_leap_feb29]
+        return df
+
+    def _rename_columns(self, df: pd.DataFrame) -> pd.DataFrame:
         rename_map = {
-            'T2m': 'temp_air', 
-            'WS10m': 'wind_speed',
-            'poa_global': 'ghi', # 假设水平面
+            'G(h)': 'ghi',
             'Gb(n)': 'dni',
             'Gd(h)': 'dhi',
-            'G(h)': 'ghi',
+            'T2m': 'temp_air',
+            'WS10m': 'wind_speed',
         }
-        data = data.rename(columns={k: v for k, v in rename_map.items() if k in data.columns})
+        df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+        return df
 
-        # 4. 如果缺少 GHI/DNI/DHI，尝试从 POA 重构 (假设 horizontal)
-        if 'ghi' not in data.columns and 'poa_direct' in data.columns:
-            logger.info("通过 POA 分量重构 GHI/DNI/DHI...")
-            data['ghi'] = data['poa_direct'] + data['poa_sky_diffuse'] + data['poa_ground_diffuse']
-            data['dhi'] = data['poa_sky_diffuse']
-            
-            # 计算 DNI = Beam_Horiz / cos(Zenith)
-            loc = pvlib.location.Location(lat, lon)
-            solpos = loc.get_solarposition(data.index)
-            zenith = solpos['apparent_zenith']
-            
-            # 避免除以零 (cos(85) ~ 0.087)
-            cos_z = np.cos(np.radians(zenith))
-            data['dni'] = data['poa_direct'] / np.maximum(cos_z, 0.01) # 限制最小值
-            
-            # 夜间修正
-            data.loc[zenith > 85, 'dni'] = 0
-            data.loc[zenith > 85, 'ghi'] = 0
-            data.loc[zenith > 85, 'dhi'] = 0
+    def _has_required_columns(self, df: pd.DataFrame) -> bool:
+        return all(col in df.columns for col in REQUIRED_COLUMNS)
 
-        # 简单校验
-        missing = [col for col in REQUIRED_COLUMNS if col not in data.columns]
+    def _validate_columns(self, df: pd.DataFrame):
+        missing = [col for col in REQUIRED_COLUMNS if col not in df.columns]
         if missing:
-            logger.warning(f"警告: 数据缺少必要列: {missing}，可能影响后续计算")
+            raise ValueError(f"气象数据缺少必要列: {missing}")
 
-        # 4. 写入缓存
-        data.to_csv(cache_file)
-        logger.info(f"数据已缓存至: {cache_file}")
-        
-        # 5. 移除闰年2月29日数据 (标准化为8760小时)
-        if not data.empty:
-            initial_len = len(data)
-            data = data[~((data.index.month == 2) & (data.index.day == 29))]
-            
-            if len(data) == 8760:
-                if initial_len > 8760:
-                    logger.info(f"检测到闰年数据，已移除2月29日 (原始: {initial_len} -> 标准化: {len(data)})")
-                else:
-                    logger.info("数据完整性确认: 8760 小时")
+    def _validate_year(self, year: int):
+        if not isinstance(year, int):
+            raise TypeError(f"year 必须是整数，得到 {type(year)}")
+        if year < PVGIS_START_YEAR or year > PVGIS_END_YEAR:
+            raise ValueError(
+                f"PVGIS 仅支持 {PVGIS_START_YEAR}-{PVGIS_END_YEAR} 年，输入 year={year}"
+            )
 
-        return data
+    def _load_from_csv(self, path: Path) -> Optional[pd.DataFrame]:
+        try:
+            df = pd.read_csv(path, index_col=0, parse_dates=True, comment='#')
+            return df
+        except Exception as e:
+            logger.warning(f"读取 {path} 失败: {e}")
+            return None
+
+    def save_raw_data(self, df: pd.DataFrame, lat: float, lon: float, year: int):
+        """保存原始气象数据到 raw_dir，并写入缓存"""
+        raw_path = self._raw_file(lat, lon, year)
+        cache_path = self._cache_file(lat, lon, year)
+
+        metadata = (
+            f"# Location: Lat={lat}, Lon={lon}\n"
+            f"# Year: {year}\n"
+            f"# Database: PVGIS-ERA5\n"
+            f"# Generated: {datetime.now(timezone.utc).isoformat()}\n"
+        )
+        for path in (cache_path, raw_path):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(metadata)
+                df.to_csv(f)
